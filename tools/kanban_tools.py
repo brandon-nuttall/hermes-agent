@@ -1267,7 +1267,8 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        ok, why = kb.unblock_task(conn, tid, with_reason=True)
+        _check(ok, why or f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 

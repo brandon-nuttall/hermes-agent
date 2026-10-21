@@ -1887,22 +1887,6 @@ def _end_run(
     return run_id
 
 
-def _first_line(text: Optional[str], limit: int) -> str:
-    """First non-blank-stripped line of ``text`` capped at ``limit`` chars; "" when empty."""
-    lines = (text or "").strip().splitlines()
-    return lines[0][:limit] if lines else ""
-
-
-def _opt_int(value: Any) -> Optional[int]:
-    """``int(value)`` or ``None`` when ``value`` is ``None`` (NULL column passthrough)."""
-    return int(value) if value is not None else None
-
-
-def _json_or_null(obj: Any) -> Optional[str]:
-    """JSON text for a payload/metadata column; falsy -> NULL."""
-    return json.dumps(obj, ensure_ascii=False) if obj else None
-
-
 def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Current ``tasks.status`` for ``task_id``, or ``None`` when no such row."""
     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -2086,6 +2070,16 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                         "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
+                # Verify after writing: this shared txn must never abort
+                # (siblings promote here too), so honesty lives in the verdict.
+                landed = _task_status(conn, task_id)
+                if landed != resume_status:
+                    _append_event(
+                        conn, task_id, "transition_reverted",
+                        {"verb": "recompute_ready", "expected_status": resume_status,
+                         "actual_status": landed},
+                    )
+                    continue
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -3483,8 +3477,9 @@ def promote_task(
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    Refused while a parent is unfinished; ``dry_run`` only validates. Returns
+    ``(ok, reason)``; an in-transaction board-gate demote lands as an honest
+    ``(False, reason)``, never a false success."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
@@ -3515,90 +3510,81 @@ def promote_task(
     if dry_run:
         return True, None
 
-    with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
-        )
-        if upd.rowcount != 1:
-            return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+    try:
+        with write_txn(conn):
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            )
+            if upd.rowcount != 1:
+                return False, f"task {task_id} status changed during promotion"
+            # Verify after writing — trust the row, never rowcount.
+            _assert_status_landed(conn, task_id, "ready", verb="promote_task")
+            _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+    except _TransitionReverted as reverted:
+        return False, record_reverted_transition(conn, reverted)
 
     return True, None
 
 
-def _reclaim_dangling_run(
-    conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
-) -> None:
-    """Close a leaked open run before a status flip so the invariant
-    ``current_run_id IS NULL <=> run row terminal`` holds; no-op normally."""
-    placeholders = ", ".join("?" for _ in statuses)
-    stale = conn.execute(
-        f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders})",
-        (task_id, *statuses),
-    ).fetchone()
-    if stale and stale["current_run_id"]:
-        conn.execute(
-            """
-            UPDATE task_runs
-               SET status = 'reclaimed', outcome = 'reclaimed',
-                   summary = COALESCE(summary, ?),
-                   ended_at = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND ended_at IS NULL
-            """,
-            (note, now, int(stale["current_run_id"])),
-        )
-
-
-def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
-    """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
-    unblock/reopen so neither can spawn a child whose upstream is unfinished."""
-    return "ready" if _parents_satisfied(conn, task_id) else "todo"
-
-
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, with_reason: bool = False,
+):
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    Returns ``bool``, or ``(ok, reason)`` with ``with_reason`` (the
+    ``request_review`` pattern). A transition demoted back in-transaction by a
+    board-gate trigger is rolled back entirely (retry budget included) and
+    reported as ``False`` — the verdict comes from the row, never ``rowcount``.
+    """
     now = int(time.time())
-    with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
-        landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
-        return True
+    reason: Optional[str] = None
+    try:
+        with write_txn(conn):
+            resume_status = (
+                _resume_status_from_events(conn, task_id)
+                if _task_status(conn, task_id) == "blocked"
+                else "ready"
+            )
+            _reclaim_dangling_run(
+                conn, task_id, statuses=("blocked", "scheduled"), now=now,
+                note="invariant recovery on unblock",
+            )
+            # Re-gate on parent completion before restoring the source phase.
+            landing_status = _landing_status_after_parents(conn, task_id)
+            new_status = (
+                "review"
+                if landing_status == "ready" and resume_status == "review"
+                else landing_status
+            )
+            # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
+            # resetting them is the amnesia that let cron-unblock <-> re-block loop
+            # unbounded; only complete_task clears them. ``consecutive_failures``
+            # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
+            # is a fresh start for the retry budget.
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                reason = f"task {task_id} is not blocked/scheduled (status changed concurrently)"
+            else:
+                # Verify after writing — trust the row, never rowcount (see docstring).
+                _assert_status_landed(conn, task_id, new_status, verb="unblock_task")
+                _append_event(
+                    conn, task_id, "unblocked",
+                    (
+                        {"status": new_status, "resume_status": resume_status}
+                        if new_status != "ready" or resume_status != "ready"
+                        else None
+                    ),
+                )
+    except _TransitionReverted as reverted:
+        reason = record_reverted_transition(conn, reverted)
+    ok = reason is None
+    return (ok, reason) if with_reason else ok
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4238,4 +4224,18 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_db_gate_revert import (
+    _TransitionReverted,
+    _assert_status_landed,
+    record_reverted_transition,
+)
+from hermes_cli.kanban_db_transitions import (
+    _landing_status_after_parents,
+    _reclaim_dangling_run,
+)
+from hermes_cli.kanban_db_format import (
+    _first_line,
+    _json_or_null,
+    _opt_int,
 )

@@ -1027,9 +1027,18 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        reasons: dict[str, str] = {}
+
+        def unblock_op(tid):
+            ok, why = kb.unblock_task(conn, tid, with_reason=True)
+            if not ok and why:
+                reasons[tid] = why
+            return ok
+
+        op = _commented(conn, reason, author, "UNBLOCK", unblock_op)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: reasons.get(
+                               tid, f"cannot unblock {tid} (not blocked/scheduled?)"))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
