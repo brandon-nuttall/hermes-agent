@@ -138,3 +138,29 @@ async def test_a_bot_chat_stamped_with_a_forwarded_login_subject_is_never_moved_
     record = await _deliver(headless.authority, 'f')
     assert record['session_id'] == old
     assert db.get_session_by_title('Bot Chat')['id'] == old and len(db._read_all('SELECT id FROM sessions')) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_closed_desktop_bot_chat_a_login_stamped_does_not_refuse_delivery_for_good(
+        headless, monkeypatch):
+    # #140183 keeps a served login's own Desktop chat in place WHILE IT IS OPEN. Closed, it is
+    # history nobody is holding: the delivery principal can neither adopt it nor move it, so the
+    # canonical title stays held and every cron beat is refused for good — the same permanent
+    # death #143715 removed for the stamps a native ticket cannot carry. A closed holder is
+    # displaced like any other dead row; the open-row protection stands unchanged.
+    from tests.waiting import async_wait_until
+    import gateway.session_worker_reservation as reservation
+    monkeypatch.setattr(reservation, 'owner_worker_subject', lambda: 'uid:1000')
+    db = headless.authority.db
+    old = _squatter(db, 'desktop_closed', column='user_id', value='github:alice', source='desktop')
+    db.end_session(old, 'cli_close')
+    first = await _deliver(headless.authority, '9')
+    new = first['session_id']
+    assert new != old and str(db.get_session(new)['chat_id']).startswith('local-'), first
+    assert db.get_session_by_title('Bot Chat')['id'] == new
+    assert db.get_session(old)['title'] == f'Bot Chat (desktop {old})'
+    second = await _deliver(headless.authority, '8')
+    assert second['session_id'] == new
+    await async_wait_until(lambda: len(headless.executed) == 2, timeout=10, interval=.05)
+    assert [sid for sid, _, _ in headless.executed] == [new, new]
+    assert len(db._read_all('SELECT id FROM sessions')) == 2

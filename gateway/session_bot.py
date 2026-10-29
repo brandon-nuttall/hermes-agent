@@ -279,7 +279,9 @@ def _kept_local_history(db, row):
     or Desktop row a native open adopts (unstamped, or stamped with a subject a native ticket
     carries: the host's own OS identity, or a structured login subject a same-user peer forwards),
     or a Desktop row a served login stamped with its label (kept as on main, even with a route
-    column or another profile's name). Any other local-source row no open can ever adopt (a route
+    column or another profile's name, but only while it is OPEN: a closed chat is history nobody
+    holds, and a row the delivery principal can neither adopt nor move would hold the title and
+    refuse every delivery for good). Any other local-source row no open can ever adopt (a route
     column left by a crash or reconnect, another profile's stamp, or outside Desktop any other
     stamp, such as a login label ``basic:alice``) is not: it held the title and refused every
     delivery for good (#141243, #143715)."""
@@ -291,9 +293,13 @@ def _kept_local_history(db, row):
     user_id = row.get('user_id')
     if (user_id and not legacy_account_label(row) and user_id != owner_worker_subject()
             and parse_authenticated_subject(user_id) is None):
-        # A Desktop row a login stamped stays where it is, as on main (#140183). On any other local
-        # source such a stamp names no subject a native ticket carries, so nobody adopts it (#143715).
-        return row.get('source') == 'desktop'
+        # A Desktop row a login stamped stays where it is, as on main (#140183) — WHILE OPEN.
+        # Closed, it is history nobody holds: the door can neither adopt it (a submit-only
+        # principal refuses) nor move it, so the title would be held and every delivery refused
+        # for good. A dead row is displaced like any other (#143715's closed dimension).
+        # On any other local source such a stamp names no subject a native ticket carries,
+        # so nobody adopts it (#143715).
+        return row.get('source') == 'desktop' and not row.get('ended_at')
     try:
         validate_legacy_row(db, row, subject=user_id)
     except RuntimeStoreError:
