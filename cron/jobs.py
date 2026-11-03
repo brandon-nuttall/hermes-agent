@@ -37,6 +37,12 @@ from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
+from cron.jobs_store_guard import (
+    _fresh_delete_tombstones,
+    _merge_unexpected_disk_jobs,
+    _record_delete_tombstones,
+    _unmerged_disk_jobs,
+)
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron import extra_fire, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
@@ -1504,49 +1510,6 @@ def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
         _jobs_lock_state.load_stamp = stamp
 
 
-def _unmerged_disk_jobs(
-    jobs: list[dict[str, Any]], removed_ids: Optional[Collection[str]]
-) -> list[dict[str, Any]]:
-    """On-disk jobs missing from *jobs* and not intentionally removed. Stamp match => nothing
-    landed, return without parsing; unreadable store => raise RuntimeError (fail closed: writing
-    over an unknown baseline would silently drop every job in it)."""
-    stamp = getattr(_jobs_lock_state, "load_stamp", None)
-    if stamp is not None and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp:
-        return []
-    disk_jobs = _peek_jobs_unlocked()
-    if disk_jobs is None:
-        raise RuntimeError(
-            f"Cron database corrupted; refusing to overwrite {_current_cron_store().jobs_file}")
-    seen = {str(j["id"]) for j in jobs if isinstance(j, dict) and j.get("id")}
-    seen |= {str(i) for i in (removed_ids or ()) if i}
-    recovered: list[dict[str, Any]] = []
-    for disk_job in disk_jobs:
-        if not isinstance(disk_job, dict) or not disk_job.get("id"):
-            continue
-        disk_id = str(disk_job["id"])
-        if disk_id not in seen:
-            recovered.append(disk_job)
-            seen.add(disk_id)
-    return recovered
-
-
-def _merge_unexpected_disk_jobs(
-    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-) -> list[dict[str, Any]]:
-    """*jobs* plus on-disk jobs absent from the payload (under the degraded flock-timeout path a
-    stale writer would otherwise clobber concurrent creates). Deletes pass ``removed_ids``; never
-    mutates *jobs*."""
-    recovered = _unmerged_disk_jobs(jobs, removed_ids)
-    if not recovered:
-        return jobs
-    logger.warning(
-        "Preserved %d cron job(s) present on disk but missing from the "
-        "in-memory save payload (concurrent create under degraded lock "
-        "or stale writer) (#80624): %s",
-        len(recovered), [j.get("id") for j in recovered])
-    return jobs + recovered
-
-
 def _unlink_quiet(path: Optional[str]) -> None:
     if path is not None:
         with contextlib.suppress(OSError):
@@ -1577,8 +1540,9 @@ def _save_jobs_unlocked(
     replace: bool = False,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
-    ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    ``replace=True`` skips the shrink-merge guard, the corrupt-store refusal and the delete
+    tombstones both ways — deliberately, so disaster recovery from a pre-removal backup can
+    still restore removed rows."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
@@ -1589,17 +1553,32 @@ def _save_jobs_unlocked(
             break
 
     # Shrink-merge loop: merge, stage, re-peek, repeat; the last attempt writes without a re-peek.
+    # Delete tombstones are re-read each attempt, symmetric with the disk re-peek (a degraded-lock
+    # sibling may have removed more jobs while we serialize); merge and re-peek share one map so a
+    # single attempt cannot disagree with itself.
     tmp_path = None
+    # The rows a delete removes are on disk NOW but gone from the payload; capture their
+    # content for the tombstone identities (the resurrection replay must be provable later).
+    removed_rows: dict[str, Any] = {}
+    if removed_ids and not replace:
+        wanted = {str(i) for i in removed_ids if i}
+        for disk_row in (_peek_jobs_unlocked() or []):
+            if isinstance(disk_row, dict) and disk_row.get("id") \
+                    and str(disk_row["id"]) in wanted:
+                removed_rows[str(disk_row["id"])] = disk_row
     try:
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
+            tombstones = None
             if not replace:
-                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+                tombstones = _fresh_delete_tombstones()
+                jobs = _merge_unexpected_disk_jobs(
+                    jobs, removed_ids=removed_ids, tombstones=tombstones)
             tmp_path = _stage_jobs_payload(jobs_file, jobs)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
                 and attempt < _SAVE_JOBS_MERGE_ATTEMPTS
-                and _unmerged_disk_jobs(jobs, removed_ids)
+                and _unmerged_disk_jobs(jobs, removed_ids, tombstones)
             ):
                 _unlink_quiet(tmp_path)
                 tmp_path = None
@@ -1610,6 +1589,10 @@ def _save_jobs_unlocked(
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
             _preserve_file_ownership(jobs_file, _stat_before)
+            if removed_ids:
+                # AFTER jobs.json is durable (see the sibling): a tombstone must never stand for
+                # a delete that did not reach disk.
+                _record_delete_tombstones(removed_ids, removed_rows)
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
