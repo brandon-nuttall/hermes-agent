@@ -149,8 +149,14 @@ def kanban_command(args: argparse.Namespace) -> int:
         return 0
 
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
-    # import DB mutators directly.
-    if _is_delegated_child_cli_mutation(args):
+    # import DB mutators directly. Sole exemption (#152639): a re-stamped dispatcher-worker
+    # lineage (fence marker carrying an own-task scope) acting on its OWN bound card with a
+    # worker lifecycle verb — the scope the spawn already granted it, and which its in-process
+    # kanban_* tools still exercise. The durable layer is opened for exactly that validated
+    # task, so anything else (other cards, orchestrator verbs, direct-import mutators) stays
+    # refused closed.
+    own_card_scope = _own_card_fence_exemption(args)
+    if own_card_scope is None and _is_delegated_child_cli_mutation(args):
         return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
@@ -176,7 +182,11 @@ def kanban_command(args: argparse.Namespace) -> int:
                         f"Create it with `hermes kanban boards create {normed}`.")
         board_scope = kb.scoped_current_board(normed)
 
-    with board_scope:
+    # (#152639) Hold the durable fence open for exactly the validated own-card scope, for the
+    # duration of this call only; nullcontext when the call is not an exempted own-card verb.
+    own_card_mutation = (kb.scoped_worker_own_card_mutation(own_card_scope)
+                         if own_card_scope else contextlib.nullcontext())
+    with board_scope, own_card_mutation:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -230,6 +240,46 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     from agent.delegation_context import kanban_path_is_fenced
 
     return kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(kb.kanban_db_path())
+
+
+# Worker lifecycle verbs that name exactly one task. A re-stamped dispatcher-worker
+# lineage whose fence marker pins an own-task scope keeps these for its own bound card
+# (#152639); every other fenced caller — delegate children, legacy markers, orchestrator
+# verbs (create/assign/link/dispatch/daemon/gc/…), board metadata — stays refused.
+_WORKER_OWN_CARD_ACTIONS: frozenset[str] = frozenset({
+    "claim", "heartbeat", "comment", "attach", "complete", "block",
+    "unblock", "edit", "request-review", "request-changes", "reopen-review",
+})
+
+
+def _named_task_ids(args: argparse.Namespace) -> list[str]:
+    """Every task id the invocation names (single positional, bulk ``--task-ids``/``--ids``)."""
+    ids: list[str] = []
+    single = getattr(args, "task_id", None)
+    if isinstance(single, str) and single.strip():
+        ids.append(single.strip())
+    for attr in ("task_ids", "ids"):
+        ids.extend(str(i).strip() for i in (getattr(args, attr, None) or []))
+    return ids
+
+
+def _own_card_fence_exemption(args: argparse.Namespace) -> Optional[str]:
+    """The own-task scope when this fenced call is exempt — a worker lifecycle verb whose
+    named task ids are ALL the marker's own bound task — else ``None`` (refuse as today).
+
+    Deliberately strict: an action naming no task is NOT exempt (its write would be
+    task-blind), a mixed bulk call is NOT exempt, and a marker without an own-scope
+    (delegate-child lineage, legacy ``"1"``) is NEVER exempt. When this returns a task id,
+    the caller must wrap the handler in ``kb.scoped_worker_own_card_mutation`` so the
+    durable fence in kanban_db relaxes for exactly this call and task.
+    """
+    from agent.delegation_context import fenced_own_task
+
+    own = fenced_own_task()
+    if not own or (getattr(args, "kanban_action", None) or "") not in _WORKER_OWN_CARD_ACTIONS:
+        return None
+    ids = _named_task_ids(args)
+    return own if ids and all(i == own for i in ids) else None
 
 
 def _joined_words(words) -> Optional[str]:

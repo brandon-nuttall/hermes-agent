@@ -136,6 +136,36 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
+_WORKER_OWN_CARD_SCOPE: ContextVar[str] = ContextVar("hermes_worker_own_card_scope", default="")
+
+
+@contextlib.contextmanager
+def scoped_worker_own_card_mutation(task_id: str):
+    """Open the durable descendant fence for exactly one task — the id the CLI entry
+    validated against a re-stamped dispatcher-worker marker's own-task scope (#152639).
+    Only ``hermes_cli.kanban.kanban_command`` sets this, after checking the action and
+    every named task id against the scope; direct importers never set it, so a
+    delegate-child mutation that skips the CLI entry still fails closed."""
+    token = _WORKER_OWN_CARD_SCOPE.set(task_id)
+    try:
+        yield
+    finally:
+        _WORKER_OWN_CARD_SCOPE.reset(token)
+
+
+def worker_own_card_scope_open() -> bool:
+    """True while a CLI-validated own-card scope covers this process's re-stamped
+    worker fence (#152639): the marker pins an own task AND the active
+    :func:`scoped_worker_own_card_mutation` holds that same task. Every layer that
+    turns the fence into an enforcement — the durable assertion and the read-only
+    connection downgrade — relaxes together under exactly this predicate, and only
+    the CLI entry (which validated action + every named task id) opens it."""
+    from agent.delegation_context import fenced_own_task
+
+    own = fenced_own_task()
+    return bool(own) and _WORKER_OWN_CARD_SCOPE.get() == own
+
+
 def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None:
     """Reject Kanban mutations from ``delegate_task`` child contexts.
 
@@ -144,11 +174,20 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
     user and board-metadata mutator fails closed before touching durable state.
     *path* is the board DB / metadata root being mutated; ``None`` means the
     lineage's own board (``kanban_home()``).
+
+    Sole relaxation (#152639): a re-stamped dispatcher-worker lineage whose marker pins
+    an own-task scope, while the CLI entry holds a :func:`scoped_worker_own_card_mutation`
+    for that same task. The grant equals what the same worker already has in-process via
+    its ``kanban_*`` tools — its own card's lifecycle, plus the board-consistency writes
+    (claim stamps, child promotion) those verbs trigger incidentally.
     """
     from agent.delegation_context import kanban_path_is_fenced
 
-    if kanban_path_is_fenced(kanban_home() if path is None else path):
-        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+    if not kanban_path_is_fenced(kanban_home() if path is None else path):
+        return
+    if worker_own_card_scope_open():
+        return
+    raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:

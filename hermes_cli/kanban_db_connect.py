@@ -721,9 +721,11 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     from agent.delegation_context import kanban_path_is_fenced
-    if kanban_path_is_fenced(path):
+    if kanban_path_is_fenced(path) and not _kb.worker_own_card_scope_open():
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
+        # Exception (#152639): a CLI-validated own-card scope needs the writable open —
+        # the ro URI would fail its INSERT as "attempt to write a readonly database".
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _kb._lossy_text
