@@ -220,6 +220,23 @@ _COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
 )
 
 
+def _compression_timeout_final_response() -> str:
+    """The timeout close for the surface that owns the session (#154404). Humans can run /new;
+    a dispatched kanban worker cannot — its retry is a FRESH session the dispatcher seeds, so the
+    worker copy states what happened and what the next attempt must do, instead of handing out a
+    command only a human can follow (a dying worker reading "run /new" as state it can act on is
+    a dead-end turn, and the text lands in the run's last_output for the NEXT attempt to read)."""
+    from agent.kanban_turn_recovery import kanban_task_id
+    if kanban_task_id() is not None:
+        return (
+            "Context compression timed out without reducing this conversation. No messages were "
+            "dropped. This dispatched kanban worker's session cannot be compacted and /new is not "
+            "actionable here: the attempt ends, and any retry starts a FRESH session with a "
+            "rebuilt worker context — re-read the card and verify on-disk state before redoing work."
+        )
+    return _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+
+
 # Stable prefix ACP/TUI match on to treat the text as cancellation metadata, not assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
@@ -1774,8 +1791,8 @@ def _run_conversation_turn(
     result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
-        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
+        # future input can move to a clean session (#98722). Worker copy via the helper (#154404).
+        result.update(error=_compression_timeout_final_response(), partial=True, compression_exhausted=True)
     return result
 
 

@@ -68,9 +68,9 @@ def run_preflight_compression(
     blocker unarmed. A forced provider-overflow preflight that any gate blocks fails
     closed (llama.cpp may silently truncate)."""
     from agent.conversation_loop import (
-        _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
-        _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
-        _should_skip_model_call_for_reference_handoff,
+        _HANDOFF_SKIP_FINAL_RESPONSE, _compression_deferred_result,
+        _compression_timeout_final_response, _maybe_grow_local_window,
+        _provider_overflow_exhausted_result, _should_skip_model_call_for_reference_handoff,
     )
 
     def _done(action: str, result: Optional[dict[str, Any]] = None) -> PreflightGateVerdict:
@@ -151,10 +151,28 @@ def run_preflight_compression(
             task_id=effective_task_id, trigger="pre_api",
         )
         if context_compression_timed_out(agent):
-            # Progress-aware timeout: never reached the provider — refund the
-            # call/budget and stop; an overflow retry would only re-compress.
+            # Progress-aware timeout. #154404: a stalled summariser is not proof the REQUEST
+            # cannot fit — only a provider 413 proves that. Fail closed (the #98722 stop) when
+            # the provider already proved the overflow or the rough count reaches the configured
+            # window (or the window is unknown); otherwise refund the call and continue
+            # UNCOMPACTED: the timeout ladder already armed the compression-failure cooldown, so
+            # the next call skips compression instead of burning the idle budget again, and a
+            # real 413 lands on the overflow path, which still fails closed. Dying here ended
+            # dispatched kanban workers' multi-hour turns minutes from their terminal call.
+            _window = int(getattr(compressor, "context_length", 0) or 0)
+            if not provider_overflow_preflight and 0 < _window and request_pressure_tokens < _window:
+                logger.warning(
+                    "Pre-API compression timed out at ~%s request tokens below the %s-token window "
+                    "— continuing uncompacted instead of ending the turn.",
+                    f"{request_pressure_tokens:,}", f"{_window:,}",
+                )
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                v._last_preflight_pressure = None
+                return _done("fallthrough")
+            # Never reached the provider — refund the call/budget and stop; an overflow
+            # retry would only re-compress.
             v.api_call_count = _refund_api_call(agent, v.api_call_count)
-            v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+            v.final_response = _compression_timeout_final_response()
             v.failed = True
             v._compression_timeout_exhausted = True
             v._turn_exit_reason = "context_compression_timeout"

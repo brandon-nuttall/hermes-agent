@@ -148,7 +148,7 @@ class _Recovery(OverflowVerdict):
         committed summary) ends the turn via the typed contract, since re-sending would
         hit the same overflow."""
         from agent.conversation_compression import conversation_history_after_compression
-        from agent.conversation_loop import _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _compression_deferred_result
+        from agent.conversation_loop import _compression_deferred_result, _compression_timeout_final_response
 
         agent = self.agent
         before = self.messages
@@ -171,7 +171,7 @@ class _Recovery(OverflowVerdict):
                 return self.done("return", deferred)
         if fail_on_timeout and context_compression_timed_out(agent):
             return self.fail_turn(
-                _COMPRESSION_TIMEOUT_FINAL_RESPONSE, turn_exit_reason="context_compression_timeout"
+                _compression_timeout_final_response(), turn_exit_reason="context_compression_timeout"
             )
         self.conversation_history = conversation_history_after_compression(
             agent, self.messages, self.conversation_history
